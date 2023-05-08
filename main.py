@@ -1,3 +1,13 @@
+from transformers import (
+    AdamW,
+    get_linear_schedule_with_warmup,
+    AlbertForSequenceClassification,
+    AlbertForMaskedLM,
+    AlbertTokenizer,
+    AlbertConfig,
+)
+from transformers.data.metrics import simple_accuracy
+
 from pet.wrapper import (
     WrapperConfig,
     TransformerModelWrapper,
@@ -11,34 +21,37 @@ from pet.wrapper import (
     EVALUATION_STEP_FUNCTIONS,
     TRAIN_STEP_FUNCTIONS,
 )
-from pet.pvp import PVP
-from transformers import (
-    InputExample,
-    AdamW,
-    get_linear_schedule_with_warmup,
-    AlbertForSequenceClassification,
-    AlbertForMaskedLM,
-    AlbertTokenizer,
-    AlbertConfig,
-)
-
 from pet.preprocessor import Preprocessor
 from pet.tasks import TASK_HELPERS
-from pet.utils import InputFeatures, DictDataset, distillation_loss
-import log
+from pet.pvp import PVP
+from pet.utils import (
+    InputExample,
+    InputFeatures,
+    DictDataset,
+    distillation_loss,
+    exact_match,
+)
+from pet import EvalConfig
 
+import log
 import json
 import jsonpickle
 import os
 from typing import List, Dict, Optional, Iterable
+
 import torch.nn as nn
 import torch
 import numpy as np
+from sklearn.metrics import f1_score
 from torch.utils.data import RandomSampler, DataLoader, SequentialSampler, Dataset
 from tqdm import trange, tqdm
 
 
 LOGGER = log.get_logger("root")
+
+
+def concat_collate_fn(batch):
+    return list(batch)
 
 
 class InputExamplesDataset(Dataset):
@@ -55,52 +68,6 @@ class InputExamplesDataset(Dataset):
 class CustomTransformerWrapper(TransformerModelWrapper):
     def __init__(self, config: WrapperConfig):
         super().__init__(config)
-
-    def train_step(
-            self,
-            batch: dict,
-            unlabeled_iter,
-            unlabeled_dataloader: DataLoader,
-            device: torch.device,
-            n_gpu: int = 1,
-            gradient_accumulation_steps: int = 1,
-            lm_training: bool = False,
-            use_logits: bool = False,
-            alpha: float = 0.8,
-            temperature: float = 1,
-            **_
-    ) -> torch.Tensor:
-        self.model.train()
-
-        unlabeled_batch = None
-        batch = {k: t.to(device) for k, t in batch.items()}
-
-        if lm_training:
-            while unlabeled_batch is None:
-                try:
-                    unlabeled_batch = unlabeled_iter.__next__()
-                except StopIteration:
-                    unlabeled_iter = unlabeled_dataloader.__iter__()
-
-            lm_input_ids = unlabeled_batch['input_ids']
-            unlabeled_batch['input_ids'], unlabeled_batch['mlm_labels'] = self._mask_tokens(lm_input_ids)
-            unlabeled_batch = {k: t.to(device) for k, t in unlabeled_batch.items()}
-
-        train_step_inputs = {
-            'unlabeled_batch': unlabeled_batch, 'lm_training': lm_training, 'alpha': alpha,
-            'use_logits': use_logits, 'temperature': temperature
-        }
-        loss = self.task_helper.train_step(batch, **train_step_inputs) if self.task_helper else None
-
-        if loss is None:
-            loss = TRAIN_STEP_FUNCTIONS[self.config.wrapper_type](self)(batch, **train_step_inputs)
-
-        if n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-        if gradient_accumulation_steps > 1:
-            loss = loss / gradient_accumulation_steps
-
-        return loss
 
     def _convert_example_to_features(self,
                                      example: InputExample,
@@ -173,7 +140,8 @@ class MultiPVPPet:
         train_sampler = RandomSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset,
                                       sampler=train_sampler,
-                                      batch_size=train_batch_size)
+                                      batch_size=train_batch_size,
+                                      collate_fn=concat_collate_fn)
 
         unlabeled_dataloader, unlabeled_iter = None, None
 
@@ -184,7 +152,8 @@ class MultiPVPPet:
             unlabeled_sampler = RandomSampler(unlabeled_dataset)
             unlabeled_dataloader = DataLoader(unlabeled_dataset,
                                               sampler=unlabeled_sampler,
-                                              batch_size=unlabeled_batch_size)
+                                              batch_size=unlabeled_batch_size,
+                                              collate_fn=concat_collate_fn)
 
         if use_logits:
             train_dataloader = unlabeled_dataloader
@@ -239,33 +208,99 @@ class MultiPVPPet:
 
         return models_optimizer, models_scheduler, pvp_weights_optimizer, pvp_weights_scheduler
 
+    def _generate_batches_from_raw_batch(
+            self,
+            raw_batch: List[InputExample],
+            labelled,
+            priming,
+    ) -> List[Dict[str, torch.Tensor]]:
+        processed_batches = []
+        for wrapper_idx, wrapper in enumerate(self.model_wrappers):
+            features = wrapper._convert_examples_to_features(raw_batch, labelled=labelled, priming=priming)
+            feature_dict = {
+                'input_ids': torch.tensor([f.input_ids for f in features], dtype=torch.long),
+                'attention_mask': torch.tensor([f.attention_mask for f in features], dtype=torch.long),
+                'token_type_ids': torch.tensor([f.token_type_ids for f in features], dtype=torch.long),
+                'labels': torch.tensor([f.label for f in features], dtype=torch.long),
+                'mlm_labels': torch.tensor([f.mlm_labels for f in features], dtype=torch.long),
+                'logits': torch.tensor([f.logits for f in features], dtype=torch.float),
+                'idx': torch.tensor([f.idx for f in features], dtype=torch.long)
+            }
+            if wrapper.config.wrapper_type == PLM_WRAPPER:
+                feature_dict['perm_mask'] = torch.tensor([f.perm_mask for f in features], dtype=torch.float)
+                feature_dict['target_mapping'] = torch.tensor([f.target_mapping for f in features], dtype=torch.float)
+
+            if wrapper.task_helper:
+                wrapper.task_helper.add_features_to_dict(features, feature_dict)
+
+            processed_batches.append(feature_dict)
+
+        return processed_batches
+
+    def _prepare_unlabeled_batches(
+            self,
+            unlabeled_batches: List[Dict[str, torch.Tensor]],
+    ) -> List[Dict[str, torch.Tensor]]:
+        for i, batch_dict in enumerate(unlabeled_batches):
+            wrapper = self.model_wrappers[i]
+            lm_input_ids = batch_dict['input_ids']
+            batch_dict['input_ids'], batch_dict['mlm_labels'] = wrapper._mask_tokens(lm_input_ids)
+            unlabeled_batches[i] = {k: t.to(self.device) for k, t in batch_dict.items()}
+
+        return unlabeled_batches
+
     def _train_step(
             self,
-            train_dataloader,
+            raw_batch: List[InputExample],
             unlabeled_dataloader,
             unlabeled_iter,
             lm_training,
-            max_grad_norm,
+            use_logits,
             alpha,
             temperature,
-            current_step,
-            logging_steps,
     ):
         for i in range(self.n_models):
             self.model_wrappers[i].model.train()
 
         # get batches for each model
-        # use _mask_tokens only ONCE (does not depend on pvp)
-        unlabeled_batches = None
-        batches = ...
+        unlabeled_raw_batch = None
+        batches = self._generate_batches_from_raw_batch(raw_batch=raw_batch, labelled=True, priming=False)
+        for batch_dict in batches:
+            for key, tensor in batch_dict.items():
+                batch_dict[key] = tensor.to(self.device)
 
         if lm_training:
-            while unlabeled_batches is None:
+            while unlabeled_raw_batch is None:
                 try:
-                    unlabeled_batches = ...  # using unlabeled_iter
+                    unlabeled_raw_batch = unlabeled_iter.__next__()
                 except StopIteration:
                     LOGGER.info("Resetting unlabeled dataset")
                     unlabeled_iter = unlabeled_dataloader.__iter__()
+            unlabeled_batches = self._generate_batches_from_raw_batch(
+                raw_batch=unlabeled_raw_batch, labelled=False, priming=False
+            )
+            unlabeled_batches = self._prepare_unlabeled_batches(unlabeled_batches)
+
+            for batch_dict in unlabeled_batches:
+                for key, tensor in batch_dict.items():
+                    batch_dict[key] = tensor.to(self.device)
+
+        losses = []
+        for i, wrapper in enumerate(self.model_wrappers):
+            batch = batches[i]
+            unlabeled_batch = unlabeled_batches[i] if unlabeled_batches else None
+            train_step_inputs = {
+                'unlabeled_batch': unlabeled_batch, 'lm_training': lm_training, 'alpha': alpha,
+                'use_logits': use_logits, 'temperature': temperature
+            }
+            loss = wrapper.task_helper.train_step(batch, **train_step_inputs) if wrapper.task_helper else None
+
+            if loss is None:
+                loss = TRAIN_STEP_FUNCTIONS[wrapper.config.wrapper_type](self)(batch, **train_step_inputs)
+
+            losses.append(loss)
+
+        return torch.cat(losses)
 
     def train(self,
               task_train_data: List[InputExample],
@@ -319,23 +354,54 @@ class MultiPVPPet:
         )
 
         current_step = 0
-        for i in range(self.n_models):
-            self.model_wrappers[i].model.zero_grad()
+        tr_loss, logging_loss = 0., 0.
+        for wrapper in self.model_wrappers:
+            wrapper.model.zero_grad()
         epoch_itor = trange(num_train_epochs, desc="# Epoch")
 
         for _ in epoch_itor:
             batch_itor = tqdm(train_dataloader, desc="# Batch")
             for batch in batch_itor:
-                self._train_step(
-                    train_dataloader,
-                    unlabeled_dataloader,
-                    unlabeled_iter,
-                    lm_training,
-                    max_grad_norm,
-                    alpha,
-                    temperature,
-                    current_step,
-                    logging_steps
+                losses = self._train_step(
+                    raw_batch=batch,
+                    unlabeled_dataloader=unlabeled_dataloader,
+                    unlabeled_iter=unlabeled_iter,
+                    lm_training=lm_training,
+                    use_logits=use_logits,
+                    alpha=alpha,
+                    temperature=temperature,
                 )
 
+                models_optimizer.zero_grad()
+                pvp_weights_optimizer.zero_grad()
+                global_loss = torch.dot(torch.softmax(self.pvp_weights, dim=None), losses)
+                global_loss.backward()
+                for wrapper in self.model_wrappers:
+                    torch.nn.utils.clip_grad_norm_(wrapper.model.parameters(), max_grad_norm)
+
+                models_optimizer.step()
+                models_scheduler.step()
+                pvp_weights_optimizer.step()
+                pvp_weights_scheduler.step()
+
                 current_step += 1
+                tr_loss += global_loss.item()
+                if current_step % logging_steps == 0:
+                    logs = {}
+                    loss_scalar = (tr_loss - logging_loss) / logging_steps
+                    learning_rate_scalar = models_scheduler.get_lr()
+                    logs['learning_rate'] = learning_rate_scalar
+                    logs['loss'] = loss_scalar
+                    logging_loss = tr_loss
+
+                    print(json.dumps({**logs, **{'step': current_step}}))
+
+                if 0 < max_steps < current_step:
+                    batch_itor.close()
+                    break
+
+            if 0 < max_steps < current_step:
+                epoch_itor.close()
+                break
+
+        return current_step, (tr_loss / current_step if current_step > 0 else -1)
