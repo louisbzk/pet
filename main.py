@@ -405,3 +405,110 @@ class MultiPVPPet:
                 break
 
         return current_step, (tr_loss / current_step if current_step > 0 else -1)
+
+    def _eval_step(self,
+                   raw_batch,
+                   priming,
+                   decoding_strategy):
+        for wrapper in self.model_wrappers:
+            wrapper.model.eval()
+
+        batches = self._generate_batches_from_raw_batch(raw_batch=raw_batch, labelled=True, priming=priming)
+        for batch_dict in batches:
+            for key, tensor in batch_dict.items():
+                batch_dict[key] = tensor.to(self.device)
+
+        preds = []
+        out_label_ids = []
+        all_indices = []
+        question_ids = []
+        with torch.no_grad():
+            for i, wrapper in enumerate(self.model_wrappers):
+                batch = batches[i]
+                labels = batch["labels"]
+                indices = batch["idx"]
+
+                if wrapper.task_helper:
+                    logits = wrapper.task_helper.eval_step(batch, decoding_strategy=decoding_strategy)
+                else:
+                    logits = EVALUATION_STEP_FUNCTIONS[wrapper.config.wrapper_type](wrapper)(batch)
+
+                preds.append(logits.detach().cpu().numpy())
+                out_label_ids.append(labels.detach().cpu().numpy())
+                all_indices.append(indices.detach().cpu().numpy())
+                if "question_idx" in batch:
+                    question_ids.append(batch["question_idx"].detach().cpu().numpy())
+
+        return {
+            "indices": np.array(all_indices),
+            "logits": np.array(preds),
+            "labels": np.array(out_label_ids),
+            "question_ids": question_ids if question_ids else None
+        }
+
+    def eval(self,
+             config: EvalConfig,
+             eval_data: List[InputExample],
+             priming_data: List[InputExample] | None,
+             batch_size: int = 8,
+             decoding_strategy: str = 'default'
+             ) -> Dict:
+        """
+        Evaluate the underlying language model.
+
+        :param config: the evaluation config
+        :param eval_data: the evaluation examples to use
+        :param priming_data: the priming data to use (if None, no priming)
+        :param batch_size: the number of evaluation examples per batch and gpu
+        :param decoding_strategy: the decoding strategy for PET with multiple masks ('default', 'ltr' or 'parallel')
+
+        :return: a dictionary of numpy arrays containing the indices, logits, labels, and (optional) question_ids for
+                 each evaluation example.
+        """
+        eval_dataset = InputExamplesDataset(eval_data)
+        eval_sampler = SequentialSampler(eval_dataset)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=batch_size)
+
+        priming = priming_data is not None
+        if priming:
+            for example in eval_data:
+                example.meta["priming_data"] = priming_data
+
+        # Do evaluation loop for each wrapper
+        eval_result = {}
+        for raw_batch in tqdm(eval_dataloader, desc="# Eval batch"):
+            batch_result = self._eval_step(raw_batch, priming, decoding_strategy)
+            if not eval_result:
+                eval_result = batch_result
+            else:
+                for key, arr in eval_result.items():
+                    for i in range(self.n_models):
+                        eval_result[key][i] = np.concatenate([eval_result[key][i], batch_result[key][i]])
+
+        # Process results for each wrapper
+        metrics = config.metrics if config.metrics else ["acc"]
+        final_results = {}
+        for i, wrapper in enumerate(self.model_wrappers):
+            predictions = np.argmax(eval_result["logits"][i], axis=1)
+            labels = eval_result["labels"][i]
+            question_ids = eval_result["question_ids"][i]
+            scores = {}
+
+            for metric in metrics:
+                if metric == 'acc':
+                    scores[metric] = simple_accuracy(predictions, labels)
+                elif metric == 'f1':
+                    scores[metric] = f1_score(labels, predictions)
+                elif metric == 'f1-macro':
+                    scores[metric] = f1_score(labels, predictions, average='macro')
+                elif metric == 'em':
+                    scores[metric] = exact_match(predictions, labels, question_ids)
+                else:
+                    raise ValueError(f"Metric '{metric}' not implemented")
+
+            final_results[i] = {
+                "scores": scores,
+                "predictions": predictions
+            }
+
+        return final_results
