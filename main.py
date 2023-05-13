@@ -139,10 +139,11 @@ class MultiPVPPet:
     def __init__(self,
                  base_config: WrapperConfig,
                  pvp_pattern_ids: Iterable[int],
+                 no_cuda: bool,
                  ):
         self.model_wrappers = []
         self.meta = []
-        self.device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device("cuda:0") if torch.cuda.is_available() and not no_cuda else torch.device("cpu")
         for i, pattern_id in enumerate(pvp_pattern_ids):
             config = base_config
             config.pattern_id = pattern_id
@@ -322,10 +323,11 @@ class MultiPVPPet:
                 'unlabeled_batch': unlabeled_batch, 'lm_training': lm_training, 'alpha': alpha,
                 'use_logits': use_logits, 'temperature': temperature
             }
+            wrapper.model.to(self.device)
             loss = wrapper.task_helper.train_step(batch, **train_step_inputs) if wrapper.task_helper else None
 
             if loss is None:
-                loss = TRAIN_STEP_FUNCTIONS[wrapper.config.wrapper_type](self)(batch, **train_step_inputs)
+                loss = TRAIN_STEP_FUNCTIONS[wrapper.config.wrapper_type](wrapper)(batch, **train_step_inputs)
 
             losses.append(loss.reshape(1))
 
@@ -642,6 +644,7 @@ def main():
 
     if args.task_name.lower() not in [
         "copa",
+        "cb",
     ]:
         raise NotImplementedError(f"Task not supported by Multi-PVP PET: '{args.task_name.lower()}'")
 
@@ -688,7 +691,7 @@ def main():
     pet_model_cfg, pet_train_cfg, pet_eval_cfg = load_pet_configs(args)
 
     print("Instantiating MultiPVPPet model...")
-    multi_pvp_model = MultiPVPPet(base_config=pet_model_cfg, pvp_pattern_ids=args.pattern_ids)
+    multi_pvp_model = MultiPVPPet(base_config=pet_model_cfg, pvp_pattern_ids=args.pattern_ids, no_cuda=args.no_cuda)
 
     print("-------------------------------------------------\n"
           "BEGIN TRAIN LOOP\n"
@@ -732,6 +735,7 @@ def main():
         results_path = results_path.with_stem(f"results_{path_digit + 1}")
     with open(results_path, 'w') as out:
         json.dump(final_results, out, indent=2, cls=ArrayEncoder)
+    print(f"Saved results at {str(results_path)}")
 
 
 if __name__ == "__main__":
