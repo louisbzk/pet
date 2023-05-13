@@ -311,8 +311,8 @@ class CopaTaskHelper(TaskHelper):
         prediction_scores = self.wrapper.model(**inputs)[0].view(-1, self.wrapper.model.config.vocab_size)
         loss_fct = CrossEntropyLoss()
 
-        loss_correct_label = loss_fct(prediction_scores, correct_targets.view(-1))
-        loss_wrong_label = loss_fct(prediction_scores, wrong_targets.view(-1))
+        loss_correct_label = loss_fct(prediction_scores, correct_targets.contiguous().view(-1))
+        loss_wrong_label = loss_fct(prediction_scores, wrong_targets.contiguous().view(-1))
         loss = 1 + loss_correct_label - loss_wrong_label
         loss[loss < 0] = 0
         return loss
@@ -544,11 +544,11 @@ class RecordTaskHelper(TaskHelper):
         all_candidate_labels = all_candidate_labels.permute(1, 0)
 
         total_loss = 0
-        loss_correct_label = loss_fct(prediction_scores, all_candidate_token_ids[0].view(-1))
+        loss_correct_label = loss_fct(prediction_scores, all_candidate_token_ids[0].contiguous().view(-1))
 
         # compute hinge loss
         for candidate_token_ids, candidate_labels in zip(all_candidate_token_ids[1:], all_candidate_labels[1:]):
-            loss_wrong_label = loss_fct(prediction_scores, candidate_token_ids.view(-1))
+            loss_wrong_label = loss_fct(prediction_scores, candidate_token_ids.contiguous().view(-1))
             hinge_loss = 1 + loss_correct_label - loss_wrong_label
             hinge_loss[hinge_loss < 0] = 0
             total_loss += hinge_loss
