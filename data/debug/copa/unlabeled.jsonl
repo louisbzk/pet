@@ -1,0 +1,5 @@
+{"premise": "The glasses on the table spilled.", "choice1": "The child drew on the table.", "choice2": "The child yanked the tablecloth.", "question": "cause", "label": 1, "idx": 368}
+{"premise": "The water in the teapot started to boil.", "choice1": "The teapot cooled.", "choice2": "The teapot whistled.", "question": "effect", "label": 1, "idx": 369}
+{"premise": "The city re-elected the mayor.", "choice1": "The city cut its budget.", "choice2": "The mayor fulfilled his promises.", "question": "cause", "label": 1, "idx": 370}
+{"premise": "The woman exaggerated the details of the story.", "choice1": "She wanted attention.", "choice2": "She felt shy.", "question": "cause", "label": 0, "idx": 371}
+{"premise": "The woman hit a midlife crisis.", "choice1": "She retired.", "choice2": "She went sky diving.", "question": "effect", "label": 1, "idx": 372}

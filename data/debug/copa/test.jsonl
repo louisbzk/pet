@@ -1,0 +1,5 @@
+{"premise": "The item was packaged in bubble wrap.", "choice1": "It was fragile.", "choice2": "It was small.", "question": "cause", "idx": 0}
+{"premise": "I emptied my pockets.", "choice1": "I retrieved a ticket stub.", "choice2": "I found a weapon.", "question": "effect", "idx": 1}
+{"premise": "Termites invaded the house.", "choice1": "The termites disappeared from the house.", "choice2": "The termites ate through the wood in the house.", "question": "effect", "idx": 2}
+{"premise": "The travelers reached the border.", "choice1": "The patrol agent checked their passports.", "choice2": "The patrol agent accused them of smuggling.", "question": "effect", "idx": 3}
+{"premise": "The office was closed.", "choice1": "It was a holiday.", "choice2": "It was summer.", "question": "cause", "idx": 4}
