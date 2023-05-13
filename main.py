@@ -739,4 +739,28 @@ def main():
 
 
 if __name__ == "__main__":
+    ### SAMPLE CONFIG ###
+    # python main.py
+    # --method
+    # pet
+    # --data_dir
+    # /home/alderson/Desktop/MVA/NLP/data/debug/cb/
+    # --model_type
+    # albert
+    # --model_name_or_path
+    # albert - base - v2
+    # --task_name
+    # cb
+    # --output_dir
+    # /home/alderson/Desktop/MVA/NLP/data/debug/outputs/cb/
+    # --pattern_ids
+    # 0
+    # 1
+    # 2
+    # --lm_training
+    # --unlabeled_examples
+    # 32
+    # --pet_per_gpu_eval_batch_size
+    # 1
+    # --no_cuda
     main()
